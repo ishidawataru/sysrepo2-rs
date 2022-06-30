@@ -1,0 +1,19 @@
+module test {
+
+  yang-version 1.1;
+
+  namespace "urn:test:params:xml:ns:yang:test";
+
+  prefix "test";
+
+  leaf test-uint32 {
+      type uint32;
+  }
+
+  leaf test-string {
+      type string;
+  }
+
+
+
+}

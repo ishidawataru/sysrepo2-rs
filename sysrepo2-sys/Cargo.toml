@@ -1,0 +1,22 @@
+[package]
+name = "sysrepo2-sys"
+version = "0.1.0"
+authors = ["Wataru Ishida <wataru.ishid@gmain.com>"]
+description = "Raw FFI bindings for sysrepo2"
+keywords = ["yang", "sysrepo"]
+edition = "2021"
+license = "MIT"
+documentation = "https://docs.rs/sysrepo2-sys"
+categories = ["external-ffi-bindings"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = { version = "0.60.1", optional = true }
+
+[features]
+# Use pre-generated FFI bindings
+default = []
+# Generate FFI bindings dynamically.
+# For this to work sysrepo2 needs to be installed in the system.
+use_bindgen = ["bindgen"]

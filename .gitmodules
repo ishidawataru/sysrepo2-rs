@@ -1,0 +1,9 @@
+[submodule "sm/yang2-rs"]
+	path = sm/yang2-rs
+	url = https://github.com/ishidawataru/yang2-rs.git
+[submodule "sm/libyang"]
+	path = sm/libyang
+	url = https://github.com/CESNET/libyang.git
+[submodule "sm/sysrepo"]
+	path = sm/sysrepo
+	url = https://github.com/sysrepo/sysrepo.git
