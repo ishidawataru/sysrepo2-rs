@@ -98,9 +98,11 @@ impl Connection {
             return Err(Error::new(ret));
         }
         Ok(Session {
-            _marker: std::marker::PhantomData,
-            _subs: Vec::new(),
+            _sub_callbacks: Vec::new(),
+            _sub_handles: Vec::new(),
+            _sub_ctxs: Vec::new(),
             inner: SessionInner(sess),
+            _marker: std::marker::PhantomData,
         })
     }
 

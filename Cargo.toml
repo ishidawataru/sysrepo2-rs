@@ -19,6 +19,7 @@ libyang2-sys = { path = "sm/yang2-rs/libyang2-sys" }
 bitflags = "1.0"
 num-traits = "0.2"
 num-derive = "0.3"
+tokio = { version = "1.0.1", features = ["macros", "rt", "rt-multi-thread", "time", "net"] }
 
 [features]
 default = []

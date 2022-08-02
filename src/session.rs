@@ -7,7 +7,9 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use crate::change::Changes;
+use std::future::Future;
+
+use crate::change::{Change, Changes};
 use crate::connection::{Connection, Context};
 use crate::error::{Error, Result};
 use crate::types::*;
@@ -16,6 +18,10 @@ use crate::value::Value;
 
 use num_traits::FromPrimitive;
 
+use tokio::io::unix::AsyncFd;
+use tokio::runtime::Handle;
+use tokio::task;
+
 use sysrepo2_sys as ffi;
 
 use yang2::data::{Data, DataTree};
@@ -23,25 +29,43 @@ use yang2::utils::Binding;
 
 use libyang2_sys;
 
-pub type ModuleChangeCallback = Box<dyn FnMut(EventType, u32, Changes) -> Result<()> + Send + Sync>;
+use std::pin::Pin;
 
-pub type OperGetItemsCallback = Box<dyn FnMut(&str, &mut DataTree) -> Result<()> + Send + Sync>;
+use std::os::unix::io::RawFd;
 
-pub struct SubscriptionInner {
-    pub(crate) module_change_callback: Option<ModuleChangeCallback>,
-    pub(crate) oper_get_items_callback: Option<OperGetItemsCallback>,
+pub type ModuleChangeCallbackSync = Box<dyn FnMut(EventType, u32, Vec<Change>) -> Result<()>>;
+
+pub type ModuleChangeCallbackAsync =
+    Box<dyn FnMut(EventType, u32, Vec<Change>) -> Pin<Box<dyn Future<Output = Result<()>>>>>;
+
+pub enum ModuleChangeCallback {
+    Sync(ModuleChangeCallbackSync),
+    Async(ModuleChangeCallbackAsync),
 }
 
-pub struct Subscription<'a> {
-    pub(crate) raw: *mut ffi::sr_subscription_ctx_t,
-    pub(crate) _inner: Box<SubscriptionInner>,
-    pub(crate) _marker: std::marker::PhantomData<&'a Session<'a>>,
+pub type OperGetItemsCallbackSync = Box<dyn FnMut(&str, &mut DataTree) -> Result<()>>;
+
+pub type OperGetItemsCallbackAsync =
+    Box<dyn FnMut(&str, DataTree) -> Pin<Box<dyn Future<Output = Result<DataTree>>>>>;
+
+pub enum OperGetItemsCallback {
+    Sync(OperGetItemsCallbackSync),
+    Async(OperGetItemsCallbackAsync),
 }
 
-impl<'a> Drop for Subscription<'a> {
+pub enum SubscriptionCallback {
+    ModuleChangeCallback(Box<ModuleChangeCallback>),
+    OperGetItemsCallback(Box<OperGetItemsCallback>),
+}
+
+pub struct Subscription(*mut ffi::sr_subscription_ctx_t);
+
+unsafe impl Send for Subscription {}
+
+impl Drop for Subscription {
     fn drop(&mut self) {
         unsafe {
-            ffi::sr_unsubscribe(self.raw);
+            ffi::sr_unsubscribe(self.0);
         }
     }
 }
@@ -55,25 +79,40 @@ unsafe extern "C" fn module_change_callback(
     request_id: u32,
     private_data: *mut ::std::os::raw::c_void,
 ) -> ::std::os::raw::c_int {
-    let inner = &mut *(private_data as *mut SubscriptionInner);
+    let callback = &mut *(private_data as *mut ModuleChangeCallback);
 
     let sess = Session {
-        _marker: std::marker::PhantomData,
-        _subs: Vec::new(),
+        _sub_callbacks: Vec::new(),
+        _sub_handles: Vec::new(),
+        _sub_ctxs: Vec::new(),
         inner: SessionInner(session),
+        _marker: std::marker::PhantomData,
     };
 
     let module = char_ptr_to_str(module_name);
-
     let path = format!("/{}:*//.", module);
 
-    let ret = (inner.module_change_callback.as_mut().unwrap())(
-        EventType::from_u32(event as u32).unwrap(),
-        request_id,
-        sess.get_changes(&path).unwrap(),
-    );
-
+    // Note from sysrepo-python subscription.py
+    //
+    // ATTENTION: the implicit session passed as argument will be
+    // freed when this function returns. The callback must NOT
+    // keep a reference on it as it will be invalid. Changes must be
+    // gathered now.
+    //
+    let changes = sess.get_changes(&path).unwrap();
+    let changes: Vec<Change> = changes.collect();
     std::mem::forget(sess); // implicit session will be freed by sysrepo
+
+    let evtype = EventType::from_u32(event as u32).unwrap();
+
+    let ret = match callback {
+        ModuleChangeCallback::Async(ref mut callback) => task::block_in_place(|| {
+            let current = Handle::current();
+            current.block_on(async { callback(evtype, request_id, changes).await })
+        }),
+        ModuleChangeCallback::Sync(ref mut callback) => callback(evtype, request_id, changes),
+    };
+
     match ret {
         Ok(_) => 0,
         Err(e) => e.errcode.try_into().unwrap(),
@@ -90,43 +129,64 @@ unsafe extern "C" fn oper_get_items_callback(
     parent: *mut *mut ffi::lyd_node,
     private_data: *mut ::std::os::raw::c_void,
 ) -> ::std::os::raw::c_int {
-    let inner = &mut *(private_data as *mut SubscriptionInner);
+    let callback = &mut *(private_data as *mut OperGetItemsCallback);
 
     let sess = Session {
-        _marker: std::marker::PhantomData,
-        _subs: Vec::new(),
+        _sub_callbacks: Vec::new(),
+        _sub_handles: Vec::new(),
+        _sub_ctxs: Vec::new(),
         inner: SessionInner(session),
+        _marker: std::marker::PhantomData,
     };
     // implicit session will be freed by sysrepo
     let mut sess = std::mem::ManuallyDrop::new(sess);
 
     let mut ctx = sess.get_context();
+
     // take the yang2 raw context inside from the sysrepo2 context `ctx`
     // and create an Arc<yang2::Context> so that we can create yang2::DataTree
     let y2ctx = Arc::new(std::mem::replace(&mut ctx.raw, None).unwrap());
+    let req_xpath = char_ptr_to_str(request_xpath);
 
-    let ret = {
+    {
         let mut data = DataTree::from_raw(&y2ctx, *parent as *mut libyang2_sys::lyd_node);
-        let req_xpath = char_ptr_to_str(request_xpath);
-        let ret = (inner.oper_get_items_callback.as_mut().unwrap())(req_xpath, &mut data);
-        // we need to call DataTree::drop() to drop a reference to `y2ctx`.
+        match callback {
+            OperGetItemsCallback::Async(callback) => {
+                // We can't pass mutable ref to an async callback
+                // Create a copy of data, get the updated data as the return value of the callback,
+                // then call data.merge to update `data`
+                let dup = data.duplicate().expect("failed to duplicate");
+                let ret = task::block_in_place(|| {
+                    let current = Handle::current();
+                    current.block_on(async { callback(req_xpath, dup).await })
+                });
+                match ret {
+                    Ok(dup) => data.merge(&dup).expect("failed to merge"),
+                    Err(e) => return e.errcode.try_into().unwrap(),
+                };
+            }
+            OperGetItemsCallback::Sync(callback) => {
+                let ret = callback(req_xpath, &mut data);
+                if let Err(e) = ret {
+                    return e.errcode.try_into().unwrap();
+                }
+            }
+        };
+        // We need to call DataTree::drop() to drop a reference to `y2ctx`.
         // Otherwise the Arc::try_unwrap() will fail.
-        // However, we can't drop `parent` since this is owned by sysrepo
-        // call DataTree::replace(std::ptr::null_mut()) to replace the internal node to null so that
-        // we can safely call DataTree::drop()
+        // However, just dropping DataTree drops `parent`, which is not what we want.
+        // Since we want to give `parent` back to sysrepo,
+        // here we call DataTree::replace(std::ptr::null_mut()) to replace the internal node to null.
         *parent = data.replace(std::ptr::null_mut()) as *mut ffi::lyd_node;
-        ret
-    };
-
-    // bring back the yang2 raw context to sysrepo2 context so that
-    // we can drop this context properly by sysrepo2::Context::drop()
-    let tmp = Arc::try_unwrap(y2ctx).unwrap();
-    assert_eq!(std::mem::replace(&mut ctx.raw, Some(tmp)), None);
-
-    match ret {
-        Ok(_) => 0,
-        Err(e) => e.errcode.try_into().unwrap(),
+        // drop data, y2ctx ref count becomes 0
     }
+
+    // put back the yang2 raw context into the sysrepo2 context so that
+    // we can drop this context properly by sysrepo2::Context::drop()
+    let raw = Arc::try_unwrap(y2ctx).unwrap();
+    assert_eq!(std::mem::replace(&mut ctx.raw, Some(raw)), None);
+
+    ffi::sr_error_t::SR_ERR_OK as i32
 }
 
 pub(crate) struct SessionInner(pub *mut ffi::sr_session_ctx_t);
@@ -138,9 +198,11 @@ impl Drop for SessionInner {
 }
 
 pub struct Session<'a> {
-    pub(crate) _marker: std::marker::PhantomData<&'a Connection>,
-    pub(crate) _subs: Vec<Subscription<'a>>,
+    pub(crate) _sub_callbacks: Vec<SubscriptionCallback>,
+    pub(crate) _sub_handles: Vec<task::JoinHandle<()>>,
+    pub(crate) _sub_ctxs: Vec<Subscription>,
     pub(crate) inner: SessionInner,
+    pub(crate) _marker: std::marker::PhantomData<&'a Connection>,
 }
 
 impl<'a> Session<'a> {
@@ -339,10 +401,47 @@ impl<'a> Session<'a> {
         &mut self,
         mod_name: &str,
         xpath: Option<&str>,
-        callback: ModuleChangeCallback,
+        callback: ModuleChangeCallbackSync,
         priority: u32,
         options: SubscriptionOptions,
     ) -> Result<()> {
+        let sub = self._subscribe_module_change(
+            mod_name,
+            xpath,
+            ModuleChangeCallback::Sync(callback),
+            priority,
+            options,
+        )?;
+        self._sub_ctxs.push(sub);
+        Ok(())
+    }
+
+    pub fn subscribe_module_change_async(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: ModuleChangeCallbackAsync,
+        priority: u32,
+        options: SubscriptionOptions,
+    ) -> Result<()> {
+        let sub = self._subscribe_module_change(
+            mod_name,
+            xpath,
+            ModuleChangeCallback::Async(callback),
+            priority,
+            options,
+        )?;
+        self.handle_event(sub)
+    }
+
+    fn _subscribe_module_change(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: ModuleChangeCallback,
+        priority: u32,
+        options: SubscriptionOptions,
+    ) -> Result<Subscription> {
         let c_mod_name = CString::new(mod_name).unwrap();
         let c_xpath = if let Some(x) = xpath {
             Some(CString::new(x).unwrap())
@@ -352,14 +451,23 @@ impl<'a> Session<'a> {
         let mut csub = std::ptr::null_mut();
         let csub_p = &mut csub;
 
-        let inner = Box::new(SubscriptionInner {
-            module_change_callback: Some(callback),
-            oper_get_items_callback: None,
-        });
-        let inner_p = Box::into_raw(inner);
+        let is_async = if let ModuleChangeCallback::Async(_) = callback {
+            true
+        } else {
+            false
+        };
 
-        unsafe {
-            let ret = ffi::sr_module_change_subscribe(
+        let options = if is_async {
+            options | SubscriptionOptions::NO_THREAD
+        } else {
+            options
+        };
+
+        let cb = Box::new(callback);
+        let cb = Box::into_raw(cb);
+
+        let ret = unsafe {
+            ffi::sr_module_change_subscribe(
                 self.inner.0,
                 c_mod_name.as_ref().as_ptr(),
                 if c_xpath.is_none() {
@@ -368,34 +476,65 @@ impl<'a> Session<'a> {
                     c_xpath.as_ref().unwrap().as_ptr()
                 },
                 Some(module_change_callback),
-                inner_p as *mut std::os::raw::c_void,
+                cb as *mut std::os::raw::c_void,
                 priority,
                 options.bits(),
                 csub_p,
-            ) as u32;
+            )
+        } as u32;
 
-            let inner = Box::from_raw(inner_p);
-
-            if ret != ffi::sr_error_t::SR_ERR_OK {
-                Err(Error::new(ret))
-            } else {
-                self._subs.push(Subscription {
-                    raw: csub,
-                    _inner: inner,
-                    _marker: std::marker::PhantomData,
-                });
-                Ok(())
-            }
+        if ret != ffi::sr_error_t::SR_ERR_OK {
+            return Err(Error::new(ret));
         }
+
+        self._sub_callbacks
+            .push(SubscriptionCallback::ModuleChangeCallback(unsafe {
+                Box::from_raw(cb)
+            }));
+
+        Ok(Subscription(csub))
     }
 
     pub fn subscribe_oper_data_request(
         &mut self,
         mod_name: &str,
         xpath: Option<&str>,
-        callback: OperGetItemsCallback,
+        callback: OperGetItemsCallbackSync,
         options: SubscriptionOptions,
     ) -> Result<()> {
+        let sub = self._subscribe_oper_data_request(
+            mod_name,
+            xpath,
+            OperGetItemsCallback::Sync(callback),
+            options,
+        )?;
+        self._sub_ctxs.push(sub);
+        Ok(())
+    }
+
+    pub fn subscribe_oper_data_request_async(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: OperGetItemsCallbackAsync,
+        options: SubscriptionOptions,
+    ) -> Result<()> {
+        let sub = self._subscribe_oper_data_request(
+            mod_name,
+            xpath,
+            OperGetItemsCallback::Async(callback),
+            options,
+        )?;
+        self.handle_event(sub)
+    }
+
+    pub fn _subscribe_oper_data_request(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: OperGetItemsCallback,
+        options: SubscriptionOptions,
+    ) -> Result<Subscription> {
         let c_mod_name = CString::new(mod_name).unwrap();
         let c_xpath = if let Some(x) = xpath {
             Some(CString::new(x).unwrap())
@@ -405,14 +544,23 @@ impl<'a> Session<'a> {
         let mut csub = std::ptr::null_mut();
         let csub_p = &mut csub;
 
-        let inner = Box::new(SubscriptionInner {
-            module_change_callback: None,
-            oper_get_items_callback: Some(callback),
-        });
-        let inner_p = Box::into_raw(inner);
+        let is_async = if let OperGetItemsCallback::Async(_) = callback {
+            true
+        } else {
+            false
+        };
 
-        unsafe {
-            let ret = ffi::sr_oper_get_subscribe(
+        let options = if is_async {
+            options | SubscriptionOptions::NO_THREAD
+        } else {
+            options
+        };
+
+        let cb = Box::new(callback);
+        let cb = Box::into_raw(cb);
+
+        let ret = unsafe {
+            ffi::sr_oper_get_subscribe(
                 self.inner.0,
                 c_mod_name.as_ref().as_ptr(),
                 if c_xpath.is_none() {
@@ -421,24 +569,88 @@ impl<'a> Session<'a> {
                     c_xpath.as_ref().unwrap().as_ptr()
                 },
                 Some(oper_get_items_callback),
-                inner_p as *mut std::os::raw::c_void,
+                cb as *mut std::os::raw::c_void,
                 options.bits(),
                 csub_p,
-            ) as u32;
+            )
+        } as u32;
 
-            let inner = Box::from_raw(inner_p);
-
-            if ret != ffi::sr_error_t::SR_ERR_OK {
-                Err(Error::new(ret))
-            } else {
-                self._subs.push(Subscription {
-                    raw: csub,
-                    _inner: inner,
-                    _marker: std::marker::PhantomData,
-                });
-                Ok(())
-            }
+        if ret != ffi::sr_error_t::SR_ERR_OK {
+            return Err(Error::new(ret));
         }
+
+        self._sub_callbacks
+            .push(SubscriptionCallback::OperGetItemsCallback(unsafe {
+                Box::from_raw(cb)
+            }));
+
+        Ok(Subscription(csub))
+    }
+
+    fn handle_event(&mut self, sub: Subscription) -> Result<()> {
+        let handle = tokio::spawn(async move {
+            let sub = sub;
+
+            let fd = {
+                let mut fd: RawFd = 0;
+                let ret = unsafe { ffi::sr_get_event_pipe(sub.0, &mut fd) as u32 };
+
+                if ret != ffi::sr_error_t::SR_ERR_OK {
+                    panic!("failed to get event pipe");
+                }
+                fd
+            };
+
+            let a = AsyncFd::new(fd).expect("Failed to create AsyncFd");
+
+            loop {
+                a.readable().await.unwrap().clear_ready();
+                {
+                    let ret = unsafe {
+                        // TODO this might take time
+                        // consider making this async or spawn this block
+                        // by task::spawn_blocking()
+                        ffi::sr_subscription_process_events(
+                            sub.0,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        ) as u32
+                    };
+                    if ret != ffi::sr_error_t::SR_ERR_OK {
+                        panic!("process event failed");
+                    }
+                }
+            }
+        });
+        self._sub_handles.push(handle);
+        Ok(())
+    }
+}
+
+impl<'a> Drop for Session<'a> {
+    fn drop(&mut self) {
+        if self._sub_handles.len() == 0 {
+            return;
+        }
+
+        // cancel all subscription event handlers and await for them
+        // this ensures Subscription destructors are called
+        task::block_in_place(|| {
+            let current = Handle::current();
+            current.block_on(async {
+                for h in &mut self._sub_handles {
+                    h.abort();
+                    match h.await {
+                        Ok(_) => panic!("subscription event handler should not return Ok()"),
+                        Err(e) => {
+                            if !e.is_cancelled() {
+                                panic!("failed to close subscription event handler: {:?}", e)
+                            }
+                        }
+                    }
+                }
+            });
+        });
     }
 }
 
@@ -578,6 +790,140 @@ mod tests {
                             )
                             .expect("Failed to print data tree");
                             Ok(())
+                        }),
+                        SubscriptionOptions::DEFAULT,
+                    )
+                    .expect("Failed to subcribe");
+                }
+
+                sess.switch_ds(DatastoreType::OPERATIONAL)
+                    .expect("Failed to switch datastore");
+
+                sess.get_item("/test:test-uint32", 0)
+                    .expect("Failed to get value")
+            };
+            let v: u32 = v.try_into().expect("Failed to convert value to u32");
+            assert_eq!(v, Arc::try_unwrap(value).unwrap().into_inner().unwrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use crate::connection::tests::ensure_test_module;
+    use crate::connection::Connection;
+    use crate::types::*;
+    use crate::value::Value;
+    use std::sync::{Arc, Mutex};
+    use yang2::data::{Data, DataFormat, DataPrinterFlags};
+
+    use tokio::task;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_subscribe_module_change_async() {
+        let mut conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        ensure_test_module(&mut conn).expect("Failed to ensure module");
+
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut sess = conn
+                .create_session(DatastoreType::RUNNING)
+                .expect("Failed to create session");
+
+            let changes = changes.clone();
+            sess.subscribe_module_change_async(
+                "test",
+                None,
+                Box::new(move |e, r, c| {
+                    let changes = changes.clone(); // clone again
+                    Box::pin(async move {
+                        for v in c {
+                            changes.lock().unwrap().push((e, r, v));
+                        }
+                        Ok(())
+                    })
+                }),
+                0,
+                SubscriptionOptions::DEFAULT,
+            )
+            .expect("Failed to subscribe");
+
+            task::spawn_blocking(|| {
+                let conn = Connection::new(ConnectionOptions::DEFAULT)
+                    .expect("Failed to create connection");
+
+                let sess = conn
+                    .create_session(DatastoreType::RUNNING)
+                    .expect("Failed to create session");
+
+                for i in vec![10u32, 20u32, 30u32] {
+                    let v = Value::from(i);
+                    sess.set_item("/test:test-uint32", &v, EditOptions::DEFAULT)
+                        .expect("Failed to set value");
+                    sess.apply_changes(0).unwrap();
+
+                    let v = sess
+                        .get_item("/test:test-uint32", 0)
+                        .expect("Failed to get value");
+                    let v: u32 = v.try_into().expect("Failed to convert value to u32");
+                    assert_eq!(v, i);
+                }
+            })
+            .await
+            .expect("Failed to test");
+        }
+
+        let changes = Arc::try_unwrap(changes).unwrap().into_inner().unwrap();
+        for c in &changes {
+            println!("{c:?}");
+        }
+        assert_eq!(changes.len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_subscribe_oper_data_request_async() {
+        let mut conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        ensure_test_module(&mut conn).expect("Failed to ensure module");
+
+        {
+            let sess = conn
+                .create_session(DatastoreType::RUNNING)
+                .expect("Failed to create session");
+            sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
+                .expect("Failed to delete");
+            sess.apply_changes(0).unwrap()
+        }
+
+        for i in vec![10u32, 20u32, 30u32] {
+            let value = Arc::new(Mutex::new(i));
+
+            let v = {
+                let mut sess = conn
+                    .create_session(DatastoreType::RUNNING)
+                    .expect("Failed to create session");
+
+                {
+                    let v = value.clone();
+                    sess.subscribe_oper_data_request_async(
+                        "test",
+                        Some("/test:test-uint32"),
+                        Box::new(move |xpath, mut data| {
+                            println!("xpath: {}", xpath);
+                            let v = v.clone(); // clone again
+                            Box::pin(async move {
+                                let v = v.lock().unwrap().to_string();
+                                data.new_path("/test:test-uint32", Some(&v), false)
+                                    .expect("Failed to create a new path");
+                                data.print_file(
+                                    std::io::stdout(),
+                                    DataFormat::JSON,
+                                    DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
+                                )
+                                .expect("Failed to print data tree");
+                                Ok(data)
+                            })
                         }),
                         SubscriptionOptions::DEFAULT,
                     )
