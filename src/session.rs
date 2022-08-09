@@ -25,7 +25,6 @@ use tokio::task;
 use sysrepo2_sys as ffi;
 
 use yang2::data::{Data, DataTree};
-use yang2::utils::Binding;
 
 use libyang2_sys;
 
@@ -150,7 +149,9 @@ unsafe extern "C" fn oper_get_items_callback(
     let req_xpath = char_ptr_to_str(request_xpath);
 
     {
-        let mut data = DataTree::from_raw(&y2ctx, *parent as *mut libyang2_sys::lyd_node);
+        let mut data = DataTree::new(&y2ctx);
+        data.replace(*parent as *mut libyang2_sys::lyd_node);
+
         match callback {
             OperGetItemsCallback::Async(callback) => {
                 // We can't pass mutable ref to an async callback
