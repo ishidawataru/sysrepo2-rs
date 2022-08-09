@@ -143,7 +143,7 @@ mod tests {
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
         log_stderr(LogLevel::DBG);
         ensure_test_module(&mut conn).expect("Failed to ensure module");
-        let sess = conn
+        let mut sess = conn
             .create_session(DatastoreType::RUNNING)
             .expect("Failed to create session");
 

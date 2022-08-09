@@ -23,13 +23,13 @@ pub struct Connection {
 }
 
 pub struct Context<'a> {
-    conn: Option<&'a mut Connection>,
-    sess: Option<&'a mut Session<'a>>,
+    conn: Option<&'a Connection>,
+    sess: Option<&'a Session<'a>>,
     pub(crate) raw: Option<YContext>,
 }
 
 impl<'a> Context<'a> {
-    fn from_connection(conn: &'a mut Connection) -> Context<'a> {
+    fn from_connection(conn: &'a Connection) -> Context<'a> {
         unsafe {
             let ctx = ffi::sr_acquire_context(conn.raw);
             let raw = YContext::from_raw(ctx as *mut ly_ctx);
@@ -41,7 +41,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    pub(crate) fn from_session(sess: &'a mut Session<'a>) -> Context<'a> {
+    pub(crate) fn from_session(sess: &'a Session<'a>) -> Context<'a> {
         unsafe {
             let ctx = ffi::sr_session_acquire_context(sess.inner.0);
             let raw = YContext::from_raw(ctx as *mut ly_ctx);
@@ -89,7 +89,7 @@ impl Connection {
         Ok(Connection { raw: conn })
     }
 
-    pub fn create_session(&self, t: DatastoreType) -> Result<Session> {
+    pub fn create_session(&mut self, t: DatastoreType) -> Result<Session> {
         let mut sess = std::ptr::null_mut();
         let sess_ptr = &mut sess;
 
@@ -106,7 +106,7 @@ impl Connection {
         })
     }
 
-    pub fn get_context(&mut self) -> Context {
+    pub fn get_context(&self) -> Context {
         Context::from_connection(self)
     }
 
@@ -185,9 +185,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_session() {
-        let conn =
+        let mut conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        let sess = conn
+        let mut sess = conn
             .create_session(DatastoreType::RUNNING)
             .expect("Failed to create session");
         assert_eq!(sess.get_ds(), DatastoreType::RUNNING);
