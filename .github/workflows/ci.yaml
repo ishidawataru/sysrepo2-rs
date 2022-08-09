@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - 
+        name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: 'true'
+      - name: Test
+        uses: dagger/dagger-for-github@v3
+        with:
+          cmds: |
+            project init
+            project update
+            do test
