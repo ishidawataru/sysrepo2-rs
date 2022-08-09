@@ -88,6 +88,8 @@ unsafe extern "C" fn module_change_callback(
         inner: SessionInner(session),
         _marker: std::marker::PhantomData,
     };
+    // implicit session will be freed by sysrepo
+    let sess = std::mem::ManuallyDrop::new(sess);
 
     let module = char_ptr_to_str(module_name);
     let path = format!("/{}:*//.", module);
@@ -101,7 +103,6 @@ unsafe extern "C" fn module_change_callback(
     //
     let changes = sess.get_changes(&path).unwrap();
     let changes: Vec<Change> = changes.collect();
-    std::mem::forget(sess); // implicit session will be freed by sysrepo
 
     let evtype = EventType::from_u32(event as u32).unwrap();
 
@@ -429,7 +430,7 @@ impl<'a> Session<'a> {
             xpath,
             ModuleChangeCallback::Async(callback),
             priority,
-            options,
+            options | SubscriptionOptions::NO_THREAD,
         )?;
         self.handle_event(sub)
     }
@@ -450,18 +451,6 @@ impl<'a> Session<'a> {
         };
         let mut csub = std::ptr::null_mut();
         let csub_p = &mut csub;
-
-        let is_async = if let ModuleChangeCallback::Async(_) = callback {
-            true
-        } else {
-            false
-        };
-
-        let options = if is_async {
-            options | SubscriptionOptions::NO_THREAD
-        } else {
-            options
-        };
 
         let cb = Box::new(callback);
         let cb = Box::into_raw(cb);
@@ -523,7 +512,7 @@ impl<'a> Session<'a> {
             mod_name,
             xpath,
             OperGetItemsCallback::Async(callback),
-            options,
+            options | SubscriptionOptions::NO_THREAD,
         )?;
         self.handle_event(sub)
     }
@@ -543,18 +532,6 @@ impl<'a> Session<'a> {
         };
         let mut csub = std::ptr::null_mut();
         let csub_p = &mut csub;
-
-        let is_async = if let OperGetItemsCallback::Async(_) = callback {
-            true
-        } else {
-            false
-        };
-
-        let options = if is_async {
-            options | SubscriptionOptions::NO_THREAD
-        } else {
-            options
-        };
 
         let cb = Box::new(callback);
         let cb = Box::into_raw(cb);

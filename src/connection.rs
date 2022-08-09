@@ -22,9 +22,13 @@ pub struct Connection {
     pub(crate) raw: *mut ffi::sr_conn_ctx_t,
 }
 
+pub enum ConnectionOrSession<'a> {
+    Connection(&'a Connection),
+    Session(&'a Session<'a>),
+}
+
 pub struct Context<'a> {
-    conn: Option<&'a Connection>,
-    sess: Option<&'a Session<'a>>,
+    ctx: ConnectionOrSession<'a>,
     pub(crate) raw: Option<YContext>,
 }
 
@@ -35,8 +39,7 @@ impl<'a> Context<'a> {
             let raw = YContext::from_raw(ctx as *mut ly_ctx);
             Context {
                 raw: Some(raw),
-                conn: Some(conn),
-                sess: None,
+                ctx: ConnectionOrSession::Connection(conn),
             }
         }
     }
@@ -47,8 +50,7 @@ impl<'a> Context<'a> {
             let raw = YContext::from_raw(ctx as *mut ly_ctx);
             Context {
                 raw: Some(raw),
-                conn: None,
-                sess: Some(sess),
+                ctx: ConnectionOrSession::Session(sess),
             }
         }
     }
@@ -68,11 +70,13 @@ impl<'a> Drop for Context<'a> {
         // take the ownership of self.raw here and use std::mem::forget() so that
         // YContext::drop() doesn't get executed for the ctx.
         std::mem::forget(std::mem::replace(&mut self.raw, None));
-        if self.conn.is_none() {
-            unsafe { ffi::sr_session_release_context(self.sess.as_ref().unwrap().inner.0) };
-        } else {
-            unsafe { ffi::sr_release_context(self.conn.as_ref().unwrap().raw) };
-        }
+
+        match self.ctx {
+            ConnectionOrSession::Connection(conn) => unsafe { ffi::sr_release_context(conn.raw) },
+            ConnectionOrSession::Session(sess) => unsafe {
+                ffi::sr_session_release_context(sess.inner.0)
+            },
+        };
     }
 }
 
