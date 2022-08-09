@@ -139,7 +139,7 @@ unsafe extern "C" fn oper_get_items_callback(
         _marker: std::marker::PhantomData,
     };
     // implicit session will be freed by sysrepo
-    let mut sess = std::mem::ManuallyDrop::new(sess);
+    let sess = std::mem::ManuallyDrop::new(sess);
 
     let mut ctx = sess.get_context();
 
@@ -206,7 +206,7 @@ pub struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    pub fn switch_ds(&self, t: DatastoreType) -> Result<()> {
+    pub fn switch_ds(&mut self, t: DatastoreType) -> Result<()> {
         let ret = unsafe { ffi::sr_session_switch_ds(self.inner.0, t as u32) as u32 };
         if ret != ffi::sr_error_t::SR_ERR_OK {
             return Err(Error {
@@ -229,11 +229,11 @@ impl<'a> Session<'a> {
         }
     }
 
-    pub fn get_context(&'a mut self) -> Context {
+    pub fn get_context(&self) -> Context {
         Context::from_session(self)
     }
 
-    pub fn set_orig_name(&self, orig_name: &str) -> Result<()> {
+    pub fn set_orig_name(&mut self, orig_name: &str) -> Result<()> {
         let ret = unsafe {
             ffi::sr_session_set_orig_name(
                 self.inner.0,
@@ -275,7 +275,7 @@ impl<'a> Session<'a> {
     /// Prepare to set (create) the value of a leaf, leaf-list, list, or presence container.
     /// These changes are applied only after calling Session::apply_changes().
     /// Data are represented as Value structures.
-    pub fn set_item(&self, path: &str, value: &Value, options: EditOptions) -> Result<()> {
+    pub fn set_item(&mut self, path: &str, value: &Value, options: EditOptions) -> Result<()> {
         let c_path = CString::new(path).unwrap();
         let ret = unsafe {
             ffi::sr_set_item(self.inner.0, c_path.as_ptr(), value.raw, options.bits()) as u32
@@ -291,7 +291,7 @@ impl<'a> Session<'a> {
     /// These changes are applied only after calling Session::apply_changes().
     /// Data are represented as pairs of a path and string value.
     pub fn set_item_str(
-        &self,
+        &mut self,
         path: &str,
         value: &str,
         origin: Option<&str>,
@@ -327,7 +327,7 @@ impl<'a> Session<'a> {
 
     /// Prepare to delete the nodes matching the specified xpath. These changes are applied only
     /// after calling Session::apply_changes(). The accepted values are the same as for Session::set_item_str().
-    pub fn delete_item(&self, path: &str, options: EditOptions) -> Result<()> {
+    pub fn delete_item(&mut self, path: &str, options: EditOptions) -> Result<()> {
         let c_path = CString::new(path).unwrap();
         let ret =
             unsafe { ffi::sr_delete_item(self.inner.0, c_path.as_ptr(), options.bits()) as u32 };
@@ -353,7 +353,7 @@ impl<'a> Session<'a> {
     /// Apply changes made in the current session.
     /// In case the changes could not be applied successfully for any reason,
     /// they remain intact in the session.
-    pub fn apply_changes(&self, timeout_ms: u32) -> Result<()> {
+    pub fn apply_changes(&mut self, timeout_ms: u32) -> Result<()> {
         let ret = unsafe { ffi::sr_apply_changes(self.inner.0, timeout_ms) as u32 };
         if ret != ffi::sr_error_t::SR_ERR_OK {
             return Err(Error::new(ret));
@@ -368,7 +368,7 @@ impl<'a> Session<'a> {
     }
 
     /// Discard prepared changes made in the current session.
-    pub fn discard_changes(&self) -> Result<()> {
+    pub fn discard_changes(&mut self) -> Result<()> {
         let ret = unsafe { ffi::sr_discard_changes(self.inner.0) as u32 };
 
         if ret != ffi::sr_error_t::SR_ERR_OK {
@@ -665,9 +665,9 @@ mod tests {
 
     #[test]
     fn test_orig_name() {
-        let conn =
+        let mut conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        let sess = conn
+        let mut sess = conn
             .create_session(DatastoreType::RUNNING)
             .expect("Failed to create session");
         sess.set_orig_name("hello")
@@ -676,9 +676,9 @@ mod tests {
 
     #[test]
     fn test_set_item() {
-        let conn =
+        let mut conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        let sess = conn
+        let mut sess = conn
             .create_session(DatastoreType::RUNNING)
             .expect("Failed to create session");
         sess.set_item_str("/test:test-uint32", "10", None, EditOptions::DEFAULT)
@@ -700,7 +700,7 @@ mod tests {
         ensure_test_module(&mut conn).expect("Failed to ensure module");
 
         {
-            let sess = conn
+            let mut sess = conn
                 .create_session(DatastoreType::RUNNING)
                 .expect("Failed to create session");
             sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
@@ -757,7 +757,7 @@ mod tests {
         ensure_test_module(&mut conn).expect("Failed to ensure module");
 
         {
-            let sess = conn
+            let mut sess = conn
                 .create_session(DatastoreType::RUNNING)
                 .expect("Failed to create session");
             sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
@@ -850,10 +850,10 @@ mod async_tests {
             .expect("Failed to subscribe");
 
             task::spawn_blocking(|| {
-                let conn = Connection::new(ConnectionOptions::DEFAULT)
+                let mut conn = Connection::new(ConnectionOptions::DEFAULT)
                     .expect("Failed to create connection");
 
-                let sess = conn
+                let mut sess = conn
                     .create_session(DatastoreType::RUNNING)
                     .expect("Failed to create session");
 
@@ -888,7 +888,7 @@ mod async_tests {
         ensure_test_module(&mut conn).expect("Failed to ensure module");
 
         {
-            let sess = conn
+            let mut sess = conn
                 .create_session(DatastoreType::RUNNING)
                 .expect("Failed to create session");
             sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
