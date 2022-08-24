@@ -5,6 +5,7 @@
 //
 
 use sysrepo2_sys as ffi;
+use yang2::Error as YError;
 
 use crate::utils::*;
 
@@ -26,6 +27,16 @@ impl Error {
             errcode,
             msg,
             error_format,
+        }
+    }
+}
+
+impl From<YError> for Error {
+    fn from(v: YError) -> Self {
+        Error {
+            errcode: ffi::sr_error_t::SR_ERR_LY,
+            msg: v.msg,
+            error_format: None,
         }
     }
 }
