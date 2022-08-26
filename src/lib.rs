@@ -13,5 +13,5 @@ pub mod session;
 pub mod types;
 pub mod value;
 
-pub use crate::error::Error;
 pub use crate::error::Result;
+pub use crate::error::{Error, ErrorCode};

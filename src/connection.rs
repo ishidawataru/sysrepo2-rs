@@ -4,7 +4,8 @@
 // See LICENSE for license details.
 //
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
+use num_traits::FromPrimitive;
 use std::ffi::CString;
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
@@ -85,29 +86,27 @@ impl Connection {
         let mut conn = std::ptr::null_mut();
         let conn_ptr = &mut conn;
 
-        let ret = unsafe { ffi::sr_connect(options.bits(), conn_ptr) as u32 };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-
-        Ok(Connection { raw: conn })
+        ErrorCode::from_i32(unsafe { ffi::sr_connect(options.bits(), conn_ptr) })
+            .map_or_else(|| Ok(Connection { raw: conn }), |ret| Err(Error::new(ret)))
     }
 
     pub fn create_session(&mut self, t: DatastoreType) -> Result<Session> {
         let mut sess = std::ptr::null_mut();
         let sess_ptr = &mut sess;
 
-        let ret = unsafe { ffi::sr_session_start(self.raw, t as u32, sess_ptr) as u32 };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(Session {
-            _sub_callbacks: Vec::new(),
-            _sub_handles: Vec::new(),
-            _sub_ctxs: Vec::new(),
-            inner: SessionInner(sess),
-            _marker: std::marker::PhantomData,
-        })
+        ErrorCode::from_i32(unsafe { ffi::sr_session_start(self.raw, t as u32, sess_ptr) })
+            .map_or_else(
+                || {
+                    Ok(Session {
+                        _sub_callbacks: Vec::new(),
+                        _sub_handles: Vec::new(),
+                        _sub_ctxs: Vec::new(),
+                        inner: SessionInner(sess),
+                        _marker: std::marker::PhantomData,
+                    })
+                },
+                |ret| Err(Error::new(ret)),
+            )
     }
 
     pub fn get_context(&self) -> Context {
@@ -143,29 +142,23 @@ impl Connection {
 
         ptrs.push(std::ptr::null());
 
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             ffi::sr_install_module(
                 self.raw,
                 schema_path.as_ptr(),
                 search_dirs.as_ptr(),
                 ptrs.as_ptr() as *mut *const ::std::os::raw::c_char,
-            ) as u32
-        };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+            )
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     pub fn remove_module(&mut self, module_name: &str, force: bool) -> Result<()> {
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             let m = CString::new(module_name.as_bytes()).unwrap();
-            ffi::sr_remove_module(self.raw, m.as_ptr(), if force { 1 } else { 0 }) as u32
-        };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+            ffi::sr_remove_module(self.raw, m.as_ptr(), if force { 1 } else { 0 })
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 }
 

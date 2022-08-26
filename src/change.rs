@@ -11,16 +11,16 @@ use std::fmt;
 use crate::session::Session;
 use crate::value::Value;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::types::*;
 
 use sysrepo2_sys as ffi;
 
 #[derive(Debug)]
 pub struct Change {
-    _operation: ChangeOperation,
-    _old: Option<Value>,
-    _new: Option<Value>,
+    pub operation: ChangeOperation,
+    pub old: Option<Value>,
+    pub new: Option<Value>,
 }
 
 impl fmt::Display for Change {
@@ -40,12 +40,10 @@ impl<'a> Changes<'a> {
         let iter_p = &mut iter;
         let c_xpath = CString::new(xpath).unwrap();
 
-        let ret =
-            unsafe { ffi::sr_get_changes_iter(sess.inner.0, c_xpath.as_ptr(), iter_p) as u32 };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(Changes { sess, iter })
+        ErrorCode::from_i32(unsafe {
+            ffi::sr_get_changes_iter(sess.inner.0, c_xpath.as_ptr(), iter_p)
+        })
+        .map_or_else(|| Ok(Changes { sess, iter }), |ret| Err(Error::new(ret)))
     }
 }
 
@@ -75,13 +73,13 @@ impl Iterator for Changes<'_> {
             return None;
         }
         Some(Change {
-            _operation: ChangeOperation::from_u32(op).unwrap(),
-            _old: if old.is_null() {
+            operation: ChangeOperation::from_u32(op).unwrap(),
+            old: if old.is_null() {
                 None
             } else {
                 Some(Value::new(old))
             },
-            _new: if new.is_null() {
+            new: if new.is_null() {
                 None
             } else {
                 Some(Value::new(new))

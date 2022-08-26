@@ -11,7 +11,7 @@ use std::future::Future;
 
 use crate::change::{Change, Changes};
 use crate::connection::{Connection, Context};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::types::*;
 use crate::utils::*;
 use crate::value::Value;
@@ -170,7 +170,7 @@ unsafe extern "C" fn oper_get_items_callback(
             OperGetItemsCallback::Sync(callback) => {
                 let ret = callback(req_xpath, &mut data);
                 if let Err(e) = ret {
-                    return e.errcode.try_into().unwrap();
+                    return e.errcode.into();
                 }
             }
         };
@@ -209,15 +209,8 @@ pub struct Session<'a> {
 
 impl<'a> Session<'a> {
     pub fn switch_ds(&mut self, t: DatastoreType) -> Result<()> {
-        let ret = unsafe { ffi::sr_session_switch_ds(self.inner.0, t as u32) as u32 };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error {
-                errcode: ret,
-                msg: None,
-                error_format: None,
-            });
-        }
-        Ok(())
+        ErrorCode::from_i32(unsafe { ffi::sr_session_switch_ds(self.inner.0, t as u32) })
+            .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     pub fn get_ds(&self) -> DatastoreType {
@@ -236,16 +229,13 @@ impl<'a> Session<'a> {
     }
 
     pub fn set_orig_name(&mut self, orig_name: &str) -> Result<()> {
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             ffi::sr_session_set_orig_name(
                 self.inner.0,
                 orig_name.as_ptr() as *const ::std::os::raw::c_char,
-            ) as u32
-        };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+            )
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     pub fn get_orig_name(&self) -> Option<&str> {
@@ -258,16 +248,18 @@ impl<'a> Session<'a> {
 
         let c_string = CString::new(path).unwrap();
 
-        let ret = unsafe {
-            ffi::sr_get_item(self.inner.0, c_string.as_ptr(), timeout_ms, value_ptr) as u32
-        };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(Value {
-            raw: value,
-            _owned: None,
+        ErrorCode::from_i32(unsafe {
+            ffi::sr_get_item(self.inner.0, c_string.as_ptr(), timeout_ms, value_ptr)
         })
+        .map_or_else(
+            || {
+                Ok(Value {
+                    raw: value,
+                    _owned: None,
+                })
+            },
+            |ret| Err(Error::new(ret)),
+        )
     }
 
     pub fn get_changes(&self, xpath: &str) -> Result<Changes> {
@@ -279,14 +271,10 @@ impl<'a> Session<'a> {
     /// Data are represented as Value structures.
     pub fn set_item(&mut self, path: &str, value: &Value, options: EditOptions) -> Result<()> {
         let c_path = CString::new(path).unwrap();
-        let ret = unsafe {
-            ffi::sr_set_item(self.inner.0, c_path.as_ptr(), value.raw, options.bits()) as u32
-        };
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+        ErrorCode::from_i32(unsafe {
+            ffi::sr_set_item(self.inner.0, c_path.as_ptr(), value.raw, options.bits())
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     /// Prepare to set (create) the value of a leaf, leaf-list, list, or presence container.
@@ -307,7 +295,7 @@ impl<'a> Session<'a> {
             None
         };
 
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             ffi::sr_set_item_str(
                 self.inner.0,
                 c_path.as_ptr(),
@@ -318,49 +306,35 @@ impl<'a> Session<'a> {
                     c_origin.unwrap().as_ptr()
                 },
                 options.bits(),
-            ) as u32
-        };
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+            )
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     /// Prepare to delete the nodes matching the specified xpath. These changes are applied only
     /// after calling Session::apply_changes(). The accepted values are the same as for Session::set_item_str().
     pub fn delete_item(&mut self, path: &str, options: EditOptions) -> Result<()> {
         let c_path = CString::new(path).unwrap();
-        let ret =
-            unsafe { ffi::sr_delete_item(self.inner.0, c_path.as_ptr(), options.bits()) as u32 };
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+        ErrorCode::from_i32(unsafe {
+            ffi::sr_delete_item(self.inner.0, c_path.as_ptr(), options.bits())
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     /// Perform the validation a datastore and any changes made in the current session, but do not
     /// apply nor discard them.
     pub fn validate(&self, module_name: &str, timeout_ms: u32) -> Result<()> {
         let c_path = CString::new(module_name).unwrap();
-        let ret = unsafe { ffi::sr_validate(self.inner.0, c_path.as_ptr(), timeout_ms) as u32 };
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+        ErrorCode::from_i32(unsafe { ffi::sr_validate(self.inner.0, c_path.as_ptr(), timeout_ms) })
+            .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     /// Apply changes made in the current session.
     /// In case the changes could not be applied successfully for any reason,
     /// they remain intact in the session.
     pub fn apply_changes(&mut self, timeout_ms: u32) -> Result<()> {
-        let ret = unsafe { ffi::sr_apply_changes(self.inner.0, timeout_ms) as u32 };
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+        ErrorCode::from_i32(unsafe { ffi::sr_apply_changes(self.inner.0, timeout_ms) })
+            .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     /// Learn whether there are any prepared non-applied changes in the session.
@@ -371,12 +345,8 @@ impl<'a> Session<'a> {
 
     /// Discard prepared changes made in the current session.
     pub fn discard_changes(&mut self) -> Result<()> {
-        let ret = unsafe { ffi::sr_discard_changes(self.inner.0) as u32 };
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+        ErrorCode::from_i32(unsafe { ffi::sr_discard_changes(self.inner.0) })
+            .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     /// Replace a datastore with the contents of a data tree. If the module is specified, limit
@@ -388,15 +358,11 @@ impl<'a> Session<'a> {
         timeout_ms: u32,
     ) -> Result<()> {
         let c_path = CString::new(module_name).unwrap();
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             let c_config = src_config.raw() as *mut ffi::lyd_node;
-            ffi::sr_replace_config(self.inner.0, c_path.as_ptr(), c_config, timeout_ms) as u32
-        };
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
-        Ok(())
+            ffi::sr_replace_config(self.inner.0, c_path.as_ptr(), c_config, timeout_ms)
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
     }
 
     pub fn subscribe_module_change(
@@ -456,7 +422,7 @@ impl<'a> Session<'a> {
         let cb = Box::new(callback);
         let cb = Box::into_raw(cb);
 
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             ffi::sr_module_change_subscribe(
                 self.inner.0,
                 c_mod_name.as_ref().as_ptr(),
@@ -471,11 +437,8 @@ impl<'a> Session<'a> {
                 options.bits(),
                 csub_p,
             )
-        } as u32;
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))?;
 
         self._sub_callbacks
             .push(SubscriptionCallback::ModuleChangeCallback(unsafe {
@@ -537,7 +500,7 @@ impl<'a> Session<'a> {
         let cb = Box::new(callback);
         let cb = Box::into_raw(cb);
 
-        let ret = unsafe {
+        ErrorCode::from_i32(unsafe {
             ffi::sr_oper_get_subscribe(
                 self.inner.0,
                 c_mod_name.as_ref().as_ptr(),
@@ -551,11 +514,8 @@ impl<'a> Session<'a> {
                 options.bits(),
                 csub_p,
             )
-        } as u32;
-
-        if ret != ffi::sr_error_t::SR_ERR_OK {
-            return Err(Error::new(ret));
-        }
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))?;
 
         self._sub_callbacks
             .push(SubscriptionCallback::OperGetItemsCallback(unsafe {
