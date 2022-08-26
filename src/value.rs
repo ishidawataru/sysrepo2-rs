@@ -4,7 +4,6 @@
 // See LICENSE for license details.
 
 use std::convert::TryInto;
-use std::ffi::CStr;
 use std::fmt;
 
 use crate::types::*;
@@ -21,14 +20,25 @@ pub struct Value {
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} = ", self.xpath())?;
+        write!(f, "{} = {}", self.xpath(), self)?;
+        Ok(())
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.value_type() {
             ValueType::Container | ValueType::ContainerPresent => write!(f, "(container)"),
             ValueType::List => write!(f, "(list instance)"),
             ValueType::Str => write!(
                 f,
                 "{}",
-                unsafe { CStr::from_ptr((*self.raw).data.string_val) }.to_string_lossy()
+                char_ptr_to_str(unsafe { (*self.raw).data.string_val })
+            ),
+            ValueType::Enum => write!(
+                f,
+                "{}",
+                char_ptr_to_str(unsafe { (*self.raw).data.enum_val })
             ),
             ValueType::Int8 => write!(f, "{}", unsafe { (*self.raw).data.int8_val }),
             ValueType::Int16 => write!(f, "{}", unsafe { (*self.raw).data.int16_val }),
