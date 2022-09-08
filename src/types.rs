@@ -97,3 +97,15 @@ pub enum ChangeOperation {
     DELETED = ffi::sr_change_oper_t::SR_OP_DELETED,
     MOVED = ffi::sr_change_oper_t::SR_OP_MOVED,
 }
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, FromPrimitive)]
+pub enum NotificationType {
+    Realtime = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_REALTIME,
+    Replay = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_REPLAY,
+    ReplayComplete = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_REPLAY_COMPLETE,
+    Terminated = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_TERMINATED,
+    Modified = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_MODIFIED,
+    Suspended = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_SUSPENDED,
+    Resumed = ffi::sr_ev_notif_type_t::SR_EV_NOTIF_RESUMED,
+}

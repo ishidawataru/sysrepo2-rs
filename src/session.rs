@@ -9,6 +9,7 @@ use std::future::Future;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use crate::change::{Change, Changes};
 use crate::connection::{Connection, SysrepoContextAllocator};
@@ -50,9 +51,26 @@ pub enum OperGetItemsCallback {
     Async(OperGetItemsCallbackAsync),
 }
 
+pub type NotificationCallbackSync =
+    Box<dyn FnMut(NotificationType, Option<&mut DataTree>, SystemTime) -> ()>;
+
+pub type NotificationCallbackAsync = Box<
+    dyn FnMut(
+        NotificationType,
+        Option<&mut DataTree>,
+        SystemTime,
+    ) -> Pin<Box<dyn Future<Output = ()>>>,
+>;
+
+pub enum NotificationCallback {
+    Sync(NotificationCallbackSync),
+    Async(NotificationCallbackAsync),
+}
+
 pub enum SubscriptionCallback {
     ModuleChangeCallback(Box<ModuleChangeCallback>),
     OperGetItemsCallback(Box<OperGetItemsCallback>),
+    NotificationCallback(Box<NotificationCallback>),
 }
 
 pub struct Subscription(*mut ffi::sr_subscription_ctx_t);
@@ -149,6 +167,42 @@ unsafe extern "C" fn oper_get_items_callback(
     *parent = dst.replace(std::ptr::null_mut()) as *mut ffi::lyd_node;
 
     0 // Ok
+}
+
+unsafe extern "C" fn notification_tree_callback(
+    session: *mut ffi::sr_session_ctx_t,
+    _sub_id: u32,
+    notif_type: ffi::sr_ev_notif_type_t::Type,
+    notif: *const ffi::lyd_node,
+    timestamp: *mut ffi::timespec,
+    private_data: *mut ::std::os::raw::c_void,
+) {
+    let callback = &mut *(private_data as *mut NotificationCallback);
+
+    let notif_type = NotificationType::from_u32(notif_type).unwrap();
+    let time = SystemTime::UNIX_EPOCH
+        + Duration::new((*timestamp).tv_sec as u64, (*timestamp).tv_nsec as u32);
+
+    let mut f = |data| {
+        match callback {
+            NotificationCallback::Async(callback) => task::block_in_place(|| {
+                let current = Handle::current();
+                current.block_on(async { callback(notif_type, data, time).await })
+            }),
+            NotificationCallback::Sync(callback) => callback(notif_type, data, time),
+        };
+    };
+
+    if notif.is_null() {
+        f(None);
+    } else {
+        let a = SysrepoContextAllocator::from_implicit_session(ImplicitSession(session));
+        let ctx = Arc::new(Context::from_allocator(Box::new(a)).unwrap());
+        let mut data = DataTree::new(&ctx);
+        data.replace(notif as *mut libyang2_sys::lyd_node);
+        f(Some(&mut data));
+        data.replace(std::ptr::null_mut()) as *mut ffi::lyd_node;
+    };
 }
 
 pub struct ImplicitSession(*mut ffi::sr_session_ctx_t);
@@ -528,6 +582,85 @@ impl Session {
         Ok(Subscription(csub))
     }
 
+    pub fn subscribe_notification(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: NotificationCallbackSync,
+        options: SubscriptionOptions,
+    ) -> Result<()> {
+        let sub = self._subscribe_notification(
+            mod_name,
+            xpath,
+            NotificationCallback::Sync(callback),
+            options,
+        )?;
+        self._sub_ctxs.push(sub);
+        Ok(())
+    }
+
+    pub fn subscribe_notification_async(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: NotificationCallbackAsync,
+        options: SubscriptionOptions,
+    ) -> Result<()> {
+        let sub = self._subscribe_notification(
+            mod_name,
+            xpath,
+            NotificationCallback::Async(callback),
+            options | SubscriptionOptions::NO_THREAD,
+        )?;
+        self.handle_event(sub)
+    }
+
+    fn _subscribe_notification(
+        &mut self,
+        mod_name: &str,
+        xpath: Option<&str>,
+        callback: NotificationCallback,
+        options: SubscriptionOptions,
+    ) -> Result<Subscription> {
+        let c_mod_name = CString::new(mod_name).unwrap();
+        let c_xpath = if let Some(x) = xpath {
+            Some(CString::new(x).unwrap())
+        } else {
+            None
+        };
+        let mut csub = std::ptr::null_mut();
+        let csub_p = &mut csub;
+
+        let cb = Box::new(callback);
+        let cb = Box::into_raw(cb);
+
+        ErrorCode::from_i32(unsafe {
+            ffi::sr_notif_subscribe_tree(
+                self.inner.0,
+                c_mod_name.as_ref().as_ptr(),
+                if c_xpath.is_none() {
+                    std::ptr::null()
+                } else {
+                    c_xpath.as_ref().unwrap().as_ptr()
+                },
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(notification_tree_callback),
+                cb as *mut std::os::raw::c_void,
+                options.bits(),
+                csub_p,
+            )
+        })
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))?;
+
+        self._sub_callbacks
+            .push(SubscriptionCallback::NotificationCallback(unsafe {
+                Box::from_raw(cb)
+            }));
+
+        Ok(Subscription(csub))
+    }
+
     fn handle_event(&mut self, sub: Subscription) -> Result<()> {
         let handle = tokio::spawn(async move {
             let sub = sub;
@@ -566,6 +699,27 @@ impl Session {
         self._sub_handles.push(handle);
         Ok(())
     }
+
+    // Notifications API
+    pub fn notification_send_ly(
+        &self,
+        notification: &mut DataTree,
+        timeout_ms: u32,
+        wait: bool,
+    ) -> Result<()> {
+        unsafe {
+            let raw = notification.replace(std::ptr::null_mut());
+            let ret = ErrorCode::from_i32(ffi::sr_notif_send_tree(
+                self.inner.0,
+                raw as *mut ffi::lyd_node,
+                timeout_ms,
+                if wait { 1 } else { 0 },
+            ));
+            notification.replace(raw);
+            ret
+        }
+        .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
+    }
 }
 
 impl Drop for Session {
@@ -598,12 +752,15 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use crate::connection::tests::ensure_test_module;
-    use crate::connection::Connection;
+    use crate::connection::{Connection, SysrepoContextAllocator};
     use crate::session::Session;
     use crate::types::*;
     use crate::value::Value;
+
+    use yang2::context::Context;
+    use yang2::data::{Data, DataFormat, DataOperation, DataPrinterFlags, DataTree};
+
     use std::sync::{Arc, Mutex};
-    use yang2::data::{Data, DataFormat, DataPrinterFlags, DataTree};
 
     #[test]
     fn test_orig_name() {
@@ -668,7 +825,7 @@ mod tests {
                 0,
                 SubscriptionOptions::DEFAULT,
             )
-            .expect("Failed to subcribe");
+            .expect("Failed to subscribe");
 
             for i in vec![10u32, 20u32, 30u32] {
                 let v = Value::from(i);
@@ -745,17 +902,93 @@ mod tests {
             assert_eq!(v, Arc::try_unwrap(value).unwrap().into_inner().unwrap());
         }
     }
+
+    #[test]
+    fn test_subscribe_notification() {
+        let conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        let conn = Arc::new(Mutex::new(conn));
+        ensure_test_module(&conn).expect("Failed to ensure module");
+
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let lnotifications = notifications.clone();
+
+        {
+            let a = SysrepoContextAllocator::from_connection(Arc::clone(&conn));
+            let ctx = Arc::new(Context::from_allocator(Box::new(a)).unwrap());
+            let lctx = ctx.clone();
+
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
+            sess.subscribe_notification(
+                "test",
+                None,
+                Box::new(move |notif_type, data, time| {
+                    if data.is_none() {
+                        return;
+                    }
+                    let data = data.unwrap();
+                    match data.duplicate_with_context(&lctx) {
+                        Ok(data) => {
+                            lnotifications
+                                .lock()
+                                .unwrap()
+                                .push((notif_type, data, time));
+                        }
+                        Err(_) => {
+                            println!("failed to merge notification data");
+                        }
+                    }
+                }),
+                SubscriptionOptions::DEFAULT,
+            )
+            .expect("Failed to subscribe");
+
+            for i in vec![10u32, 20u32, 30u32] {
+                let d = format!("{{\"test:notif\": {{\"value\": {}}}}}", i);
+                let mut notification = DataTree::parse_op_string(
+                    &ctx,
+                    &d,
+                    DataFormat::JSON,
+                    DataOperation::NotificationYang,
+                )
+                .expect("failed to parse YANG NOTIFICATION");
+
+                sess.notification_send_ly(&mut notification, 0, true)
+                    .expect("Failed to send a notification");
+            }
+        }
+
+        let notifications = Arc::try_unwrap(notifications)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+
+        for n in &notifications {
+            println!("{:?}", n.0);
+            n.1.print_file(
+                std::io::stdout(),
+                DataFormat::JSON,
+                DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
+            )
+            .expect("Failed to print data tree");
+        }
+        assert_eq!(notifications.len(), 3);
+    }
 }
 
 #[cfg(test)]
 mod async_tests {
+    use std::sync::{Arc, Mutex};
+
     use crate::connection::tests::ensure_test_module;
-    use crate::connection::Connection;
+    use crate::connection::{Connection, SysrepoContextAllocator};
     use crate::session::Session;
     use crate::types::*;
     use crate::value::Value;
-    use std::sync::{Arc, Mutex};
-    use yang2::data::{Data, DataFormat, DataPrinterFlags, DataTree};
+
+    use yang2::context::Context;
+    use yang2::data::{Data, DataFormat, DataOperation, DataPrinterFlags, DataTree};
 
     use tokio::task;
 
@@ -878,5 +1111,87 @@ mod async_tests {
             let v: u32 = v.try_into().expect("Failed to convert value to u32");
             assert_eq!(v, Arc::try_unwrap(value).unwrap().into_inner().unwrap());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_subscribe_notification_async() {
+        let conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        let conn = Arc::new(Mutex::new(conn));
+        ensure_test_module(&conn).expect("Failed to ensure module");
+
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let lnotifications = notifications.clone();
+
+        {
+            let a = SysrepoContextAllocator::from_connection(Arc::clone(&conn));
+            let ctx = Arc::new(Context::from_allocator(Box::new(a)).unwrap());
+            let lctx = ctx.clone();
+
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
+            sess.subscribe_notification_async(
+                "test",
+                None,
+                Box::new(move |notif_type, data, time| {
+                    let lnotifications = lnotifications.clone();
+                    let lctx = lctx.clone();
+                    let data = if data.is_none() {
+                        None
+                    } else {
+                        Some(data.unwrap().duplicate_with_context(&lctx))
+                    };
+                    Box::pin(async move {
+                        if data.is_none() {
+                            return;
+                        }
+                        let data = data.unwrap();
+                        match data {
+                            Ok(data) => {
+                                lnotifications
+                                    .lock()
+                                    .unwrap()
+                                    .push((notif_type, data, time));
+                            }
+                            Err(_) => {
+                                println!("failed to merge notification data");
+                            }
+                        }
+                    })
+                }),
+                SubscriptionOptions::DEFAULT,
+            )
+            .expect("Failed to subscribe");
+
+            for i in vec![10u32, 20u32, 30u32] {
+                let d = format!("{{\"test:notif\": {{\"value\": {}}}}}", i);
+                let mut notification = DataTree::parse_op_string(
+                    &ctx,
+                    &d,
+                    DataFormat::JSON,
+                    DataOperation::NotificationYang,
+                )
+                .expect("failed to parse YANG NOTIFICATION");
+
+                sess.notification_send_ly(&mut notification, 0, true)
+                    .expect("Failed to send a notification");
+            }
+        }
+
+        let notifications = Arc::try_unwrap(notifications)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+
+        for n in &notifications {
+            println!("{:?}", n.0);
+            n.1.print_file(
+                std::io::stdout(),
+                DataFormat::JSON,
+                DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
+            )
+            .expect("Failed to print data tree");
+        }
+        assert_eq!(notifications.len(), 3);
     }
 }

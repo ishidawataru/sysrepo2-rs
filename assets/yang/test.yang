@@ -14,6 +14,10 @@ module test {
       type string;
   }
 
-
+  notification notif {
+      leaf value {
+          type uint32;
+      }
+  }
 
 }
