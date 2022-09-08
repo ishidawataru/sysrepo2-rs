@@ -5,12 +5,13 @@
 //
 
 use std::ffi::CString;
-use std::sync::Arc;
-
 use std::future::Future;
+use std::os::unix::io::RawFd;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use crate::change::{Change, Changes};
-use crate::connection::{Connection, Context};
+use crate::connection::{Connection, SysrepoContextAllocator};
 use crate::error::{Error, ErrorCode, Result};
 use crate::types::*;
 use crate::utils::*;
@@ -24,13 +25,10 @@ use tokio::task;
 
 use sysrepo2_sys as ffi;
 
+use yang2::context::Context;
 use yang2::data::{Data, DataTree};
 
 use libyang2_sys;
-
-use std::pin::Pin;
-
-use std::os::unix::io::RawFd;
 
 pub type ModuleChangeCallbackSync = Box<dyn FnMut(EventType, u32, Vec<Change>) -> Result<()>>;
 
@@ -42,10 +40,10 @@ pub enum ModuleChangeCallback {
     Async(ModuleChangeCallbackAsync),
 }
 
-pub type OperGetItemsCallbackSync = Box<dyn FnMut(&str, &mut DataTree) -> Result<()>>;
+pub type OperGetItemsCallbackSync = Box<dyn FnMut(&str, Arc<Context>) -> Result<DataTree>>;
 
 pub type OperGetItemsCallbackAsync =
-    Box<dyn FnMut(&str, DataTree) -> Pin<Box<dyn Future<Output = Result<DataTree>>>>>;
+    Box<dyn FnMut(&str, Arc<Context>) -> Pin<Box<dyn Future<Output = Result<DataTree>>>>>;
 
 pub enum OperGetItemsCallback {
     Sync(OperGetItemsCallbackSync),
@@ -80,16 +78,6 @@ unsafe extern "C" fn module_change_callback(
 ) -> ::std::os::raw::c_int {
     let callback = &mut *(private_data as *mut ModuleChangeCallback);
 
-    let sess = Session {
-        _sub_callbacks: Vec::new(),
-        _sub_handles: Vec::new(),
-        _sub_ctxs: Vec::new(),
-        inner: SessionInner(session),
-        _marker: std::marker::PhantomData,
-    };
-    // implicit session will be freed by sysrepo
-    let sess = std::mem::ManuallyDrop::new(sess);
-
     let module = char_ptr_to_str(module_name);
     let path = format!("/{}:*//.", module);
 
@@ -100,6 +88,7 @@ unsafe extern "C" fn module_change_callback(
     // keep a reference on it as it will be invalid. Changes must be
     // gathered now.
     //
+    let sess = ImplicitSession(session);
     let changes = sess.get_changes(&path).unwrap();
     let changes: Vec<Change> = changes.collect();
 
@@ -131,64 +120,53 @@ unsafe extern "C" fn oper_get_items_callback(
 ) -> ::std::os::raw::c_int {
     let callback = &mut *(private_data as *mut OperGetItemsCallback);
 
-    let sess = Session {
-        _sub_callbacks: Vec::new(),
-        _sub_handles: Vec::new(),
-        _sub_ctxs: Vec::new(),
-        inner: SessionInner(session),
-        _marker: std::marker::PhantomData,
-    };
-    // implicit session will be freed by sysrepo
-    let sess = std::mem::ManuallyDrop::new(sess);
-
-    let mut ctx = sess.get_context();
-
-    // take the yang2 raw context inside from the sysrepo2 context `ctx`
-    // and create an Arc<yang2::Context> so that we can create yang2::DataTree
-    let y2ctx = Arc::new(std::mem::replace(&mut ctx.raw, None).unwrap());
     let req_xpath = char_ptr_to_str(request_xpath);
 
-    {
-        let mut data = DataTree::new(&y2ctx);
-        data.replace(*parent as *mut libyang2_sys::lyd_node);
+    let a = SysrepoContextAllocator::from_implicit_session(ImplicitSession(session));
+    let ctx = Arc::new(Context::from_allocator(Box::new(a)).unwrap());
 
-        match callback {
-            OperGetItemsCallback::Async(callback) => {
-                // We can't pass mutable ref to an async callback
-                // Create a copy of data, get the updated data as the return value of the callback,
-                // then call data.merge to update `data`
-                let dup = data.duplicate().expect("failed to duplicate");
-                let ret = task::block_in_place(|| {
-                    let current = Handle::current();
-                    current.block_on(async { callback(req_xpath, dup).await })
-                });
-                match ret {
-                    Ok(dup) => data.merge(&dup).expect("failed to merge"),
-                    Err(e) => return e.errcode.try_into().unwrap(),
-                };
-            }
-            OperGetItemsCallback::Sync(callback) => {
-                let ret = callback(req_xpath, &mut data);
-                if let Err(e) = ret {
-                    return e.errcode.into();
-                }
-            }
-        };
-        // We need to call DataTree::drop() to drop a reference to `y2ctx`.
-        // Otherwise the Arc::try_unwrap() will fail.
-        // However, just dropping DataTree drops `parent`, which is not what we want.
-        // Since we want to give `parent` back to sysrepo,
-        // here we call DataTree::replace(std::ptr::null_mut()) to replace the internal node to null.
-        *parent = data.replace(std::ptr::null_mut()) as *mut ffi::lyd_node;
-        // drop data, y2ctx ref count becomes 0
+    let src = match callback {
+        OperGetItemsCallback::Sync(callback) => callback(req_xpath, ctx),
+        OperGetItemsCallback::Async(callback) => task::block_in_place(|| {
+            let current = Handle::current();
+            current.block_on(callback(req_xpath, ctx))
+        }),
+    };
+
+    if let Err(e) = src {
+        return e.errcode.try_into().unwrap();
     }
 
-    // put back the yang2 raw context into the sysrepo2 context so that
-    // we can drop this context properly by sysrepo2::Context::drop()
-    let raw = Arc::try_unwrap(y2ctx).unwrap();
-    assert_eq!(std::mem::replace(&mut ctx.raw, Some(raw)), None);
+    let src = src.unwrap();
+    let a = SysrepoContextAllocator::from_implicit_session(ImplicitSession(session));
+    let ctx = Arc::new(Context::from_allocator(Box::new(a)).unwrap());
+    let mut dst = DataTree::new(&ctx);
+    dst.replace(*parent as *mut libyang2_sys::lyd_node);
+    if let Err(_) = dst.merge(&src) {
+        return ErrorCode::Ly.into();
+    }
 
-    ffi::sr_error_t::SR_ERR_OK as i32
+    *parent = dst.replace(std::ptr::null_mut()) as *mut ffi::lyd_node;
+
+    0 // Ok
+}
+
+pub struct ImplicitSession(*mut ffi::sr_session_ctx_t);
+
+pub trait SessionContextHolder {
+    fn raw(&self) -> *mut ffi::sr_session_ctx_t;
+}
+
+impl SessionContextHolder for ImplicitSession {
+    fn raw(&self) -> *mut ffi::sr_session_ctx_t {
+        self.0
+    }
+}
+
+impl ImplicitSession {
+    pub fn get_changes(&self, xpath: &str) -> Result<Changes<Self>> {
+        Changes::new(self, xpath)
+    }
 }
 
 pub(crate) struct SessionInner(pub *mut ffi::sr_session_ctx_t);
@@ -199,15 +177,44 @@ impl Drop for SessionInner {
     }
 }
 
-pub struct Session<'a> {
+pub struct Session {
+    pub(crate) _sub_ctxs: Vec<Subscription>,
     pub(crate) _sub_callbacks: Vec<SubscriptionCallback>,
     pub(crate) _sub_handles: Vec<task::JoinHandle<()>>,
-    pub(crate) _sub_ctxs: Vec<Subscription>,
     pub(crate) inner: SessionInner,
-    pub(crate) _marker: std::marker::PhantomData<&'a Connection>,
+    pub(crate) _conn: Option<Arc<Mutex<Connection>>>,
 }
 
-impl<'a> Session<'a> {
+unsafe impl Send for Session {}
+
+impl SessionContextHolder for Session {
+    fn raw(&self) -> *mut ffi::sr_session_ctx_t {
+        self.inner.0
+    }
+}
+
+impl Session {
+    pub fn new(conn: &Arc<Mutex<Connection>>, t: DatastoreType) -> Result<Session> {
+        let mut sess = std::ptr::null_mut();
+        let sess_ptr = &mut sess;
+
+        ErrorCode::from_i32(unsafe {
+            ffi::sr_session_start(conn.lock().unwrap().raw(), t as u32, sess_ptr)
+        })
+        .map_or_else(
+            || {
+                Ok(Session {
+                    _sub_callbacks: Vec::new(),
+                    _sub_handles: Vec::new(),
+                    _sub_ctxs: Vec::new(),
+                    inner: SessionInner(sess),
+                    _conn: Some(Arc::clone(conn)),
+                })
+            },
+            |ret| Err(Error::new(ret)),
+        )
+    }
+
     pub fn switch_ds(&mut self, t: DatastoreType) -> Result<()> {
         ErrorCode::from_i32(unsafe { ffi::sr_session_switch_ds(self.inner.0, t as u32) })
             .map_or_else(|| Ok(()), |ret| Err(Error::new(ret)))
@@ -222,10 +229,6 @@ impl<'a> Session<'a> {
             ffi::sr_datastore_t::SR_DS_OPERATIONAL => DatastoreType::OPERATIONAL,
             _ => panic!("unknown datastore type"),
         }
-    }
-
-    pub fn get_context(&self) -> Context {
-        Context::from_session(self)
     }
 
     pub fn set_orig_name(&mut self, orig_name: &str) -> Result<()> {
@@ -262,7 +265,7 @@ impl<'a> Session<'a> {
         )
     }
 
-    pub fn get_changes(&self, xpath: &str) -> Result<Changes> {
+    pub fn get_changes(&self, xpath: &str) -> Result<Changes<Self>> {
         Changes::new(self, xpath)
     }
 
@@ -565,7 +568,7 @@ impl<'a> Session<'a> {
     }
 }
 
-impl<'a> Drop for Session<'a> {
+impl Drop for Session {
     fn drop(&mut self) {
         if self._sub_handles.len() == 0 {
             return;
@@ -596,29 +599,30 @@ impl<'a> Drop for Session<'a> {
 mod tests {
     use crate::connection::tests::ensure_test_module;
     use crate::connection::Connection;
+    use crate::session::Session;
     use crate::types::*;
     use crate::value::Value;
     use std::sync::{Arc, Mutex};
-    use yang2::data::{Data, DataFormat, DataPrinterFlags};
+    use yang2::data::{Data, DataFormat, DataPrinterFlags, DataTree};
 
     #[test]
     fn test_orig_name() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        let mut sess = conn
-            .create_session(DatastoreType::RUNNING)
-            .expect("Failed to create session");
+        let conn = Arc::new(Mutex::new(conn));
+        let mut sess =
+            Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
         sess.set_orig_name("hello")
             .expect("Failed to set original name");
     }
 
     #[test]
     fn test_set_item() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        let mut sess = conn
-            .create_session(DatastoreType::RUNNING)
-            .expect("Failed to create session");
+        let conn = Arc::new(Mutex::new(conn));
+        let mut sess =
+            Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
         sess.set_item_str("/test:test-uint32", "10", None, EditOptions::DEFAULT)
             .expect("Failed to set value");
         sess.apply_changes(0).expect("Failed to apply changes");
@@ -633,14 +637,14 @@ mod tests {
 
     #[test]
     fn test_subscribe_module_change() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        ensure_test_module(&mut conn).expect("Failed to ensure module");
+        let conn = Arc::new(Mutex::new(conn));
+        ensure_test_module(&conn).expect("Failed to ensure module");
 
         {
-            let mut sess = conn
-                .create_session(DatastoreType::RUNNING)
-                .expect("Failed to create session");
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
             sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
                 .expect("Failed to delete");
             sess.apply_changes(0).unwrap()
@@ -648,9 +652,8 @@ mod tests {
 
         let changes = Arc::new(Mutex::new(Vec::new()));
         {
-            let mut sess = conn
-                .create_session(DatastoreType::RUNNING)
-                .expect("Failed to create session");
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
 
             let lchanges = changes.clone();
             sess.subscribe_module_change(
@@ -689,15 +692,15 @@ mod tests {
     }
 
     #[test]
-    fn test_subscribe_oper_data_request() {
-        let mut conn =
+    fn test_subscribe_oper_data_request_sync() {
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        ensure_test_module(&mut conn).expect("Failed to ensure module");
+        let conn = Arc::new(Mutex::new(conn));
+        ensure_test_module(&conn).expect("Failed to ensure module");
 
         {
-            let mut sess = conn
-                .create_session(DatastoreType::RUNNING)
-                .expect("Failed to create session");
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
             sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
                 .expect("Failed to delete");
             sess.apply_changes(0).unwrap()
@@ -707,32 +710,30 @@ mod tests {
             let value = Arc::new(Mutex::new(i));
 
             let v = {
-                let mut sess = conn
-                    .create_session(DatastoreType::RUNNING)
-                    .expect("Failed to create session");
+                let mut sess =
+                    Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
 
-                {
-                    let v = value.clone();
-                    sess.subscribe_oper_data_request(
-                        "test",
-                        Some("/test:test-uint32"),
-                        Box::new(move |xpath, data| {
-                            println!("xpath: {}", xpath);
-                            let v = (*v).lock().unwrap().to_string();
-                            data.new_path("/test:test-uint32", Some(&v), false)
-                                .expect("Failed to create a new path");
-                            data.print_file(
-                                std::io::stdout(),
-                                DataFormat::JSON,
-                                DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
-                            )
-                            .expect("Failed to print data tree");
-                            Ok(())
-                        }),
-                        SubscriptionOptions::DEFAULT,
-                    )
-                    .expect("Failed to subcribe");
-                }
+                let v = Arc::clone(&value);
+                sess.subscribe_oper_data_request(
+                    "test",
+                    Some("/test:test-uint32"),
+                    Box::new(move |xpath, ctx| {
+                        println!("xpath: {}", xpath);
+                        let v = v.lock().unwrap().to_string();
+                        let mut data = DataTree::new(&ctx);
+                        data.new_path("/test:test-uint32", Some(&v), false)
+                            .expect("Failed to create a new path");
+                        data.print_file(
+                            std::io::stdout(),
+                            DataFormat::JSON,
+                            DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
+                        )
+                        .expect("Failed to print data tree");
+                        Ok(data)
+                    }),
+                    SubscriptionOptions::DEFAULT,
+                )
+                .expect("Failed to subcribe");
 
                 sess.switch_ds(DatastoreType::OPERATIONAL)
                     .expect("Failed to switch datastore");
@@ -750,24 +751,25 @@ mod tests {
 mod async_tests {
     use crate::connection::tests::ensure_test_module;
     use crate::connection::Connection;
+    use crate::session::Session;
     use crate::types::*;
     use crate::value::Value;
     use std::sync::{Arc, Mutex};
-    use yang2::data::{Data, DataFormat, DataPrinterFlags};
+    use yang2::data::{Data, DataFormat, DataPrinterFlags, DataTree};
 
     use tokio::task;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_subscribe_module_change_async() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        ensure_test_module(&mut conn).expect("Failed to ensure module");
+        let conn = Arc::new(Mutex::new(conn));
+        ensure_test_module(&conn).expect("Failed to ensure module");
 
         let changes = Arc::new(Mutex::new(Vec::new()));
         {
-            let mut sess = conn
-                .create_session(DatastoreType::RUNNING)
-                .expect("Failed to create session");
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
 
             let changes = changes.clone();
             sess.subscribe_module_change_async(
@@ -788,12 +790,12 @@ mod async_tests {
             .expect("Failed to subscribe");
 
             task::spawn_blocking(|| {
-                let mut conn = Connection::new(ConnectionOptions::DEFAULT)
+                let conn = Connection::new(ConnectionOptions::DEFAULT)
                     .expect("Failed to create connection");
+                let conn = Arc::new(Mutex::new(conn));
 
-                let mut sess = conn
-                    .create_session(DatastoreType::RUNNING)
-                    .expect("Failed to create session");
+                let mut sess =
+                    Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
 
                 for i in vec![10u32, 20u32, 30u32] {
                     let v = Value::from(i);
@@ -821,14 +823,15 @@ mod async_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_subscribe_oper_data_request_async() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        ensure_test_module(&mut conn).expect("Failed to ensure module");
+        let conn = Arc::new(Mutex::new(conn));
+
+        ensure_test_module(&conn).expect("Failed to ensure module");
 
         {
-            let mut sess = conn
-                .create_session(DatastoreType::RUNNING)
-                .expect("Failed to create session");
+            let mut sess =
+                Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
             sess.delete_item("/test:test-uint32", EditOptions::DEFAULT)
                 .expect("Failed to delete");
             sess.apply_changes(0).unwrap()
@@ -838,39 +841,37 @@ mod async_tests {
             let value = Arc::new(Mutex::new(i));
 
             let v = {
-                let mut sess = conn
-                    .create_session(DatastoreType::RUNNING)
-                    .expect("Failed to create session");
+                let mut sess =
+                    Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
 
-                {
-                    let v = value.clone();
-                    sess.subscribe_oper_data_request_async(
-                        "test",
-                        Some("/test:test-uint32"),
-                        Box::new(move |xpath, mut data| {
-                            println!("xpath: {}", xpath);
-                            let v = v.clone(); // clone again
-                            Box::pin(async move {
-                                let v = v.lock().unwrap().to_string();
-                                data.new_path("/test:test-uint32", Some(&v), false)
-                                    .expect("Failed to create a new path");
-                                data.print_file(
-                                    std::io::stdout(),
-                                    DataFormat::JSON,
-                                    DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
-                                )
-                                .expect("Failed to print data tree");
-                                Ok(data)
-                            })
-                        }),
-                        SubscriptionOptions::DEFAULT,
-                    )
-                    .expect("Failed to subcribe");
-                }
+                let v = Arc::clone(&value);
+
+                sess.subscribe_oper_data_request_async(
+                    "test",
+                    Some("/test:test-uint32"),
+                    Box::new(move |xpath, ctx| {
+                        println!("xpath: {}", xpath);
+                        let v = Arc::clone(&v);
+                        Box::pin(async move {
+                            let v = v.lock().unwrap().to_string();
+                            let mut data = DataTree::new(&ctx);
+                            data.new_path("/test:test-uint32", Some(&v), false)
+                                .expect("Failed to create a new path");
+                            data.print_file(
+                                std::io::stdout(),
+                                DataFormat::JSON,
+                                DataPrinterFlags::WD_ALL | DataPrinterFlags::WITH_SIBLINGS,
+                            )
+                            .expect("Failed to print data tree");
+                            Ok(data)
+                        })
+                    }),
+                    SubscriptionOptions::DEFAULT,
+                )
+                .expect("Failed to subcribe");
 
                 sess.switch_ds(DatastoreType::OPERATIONAL)
                     .expect("Failed to switch datastore");
-
                 sess.get_item("/test:test-uint32", 0)
                     .expect("Failed to get value")
             };

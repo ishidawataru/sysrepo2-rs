@@ -145,17 +145,20 @@ mod tests {
     use crate::connection::tests::ensure_test_module;
     use crate::connection::*;
     use crate::log::*;
+    use crate::session::Session;
     use crate::value::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_value() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
         log_stderr(LogLevel::DBG);
-        ensure_test_module(&mut conn).expect("Failed to ensure module");
-        let mut sess = conn
-            .create_session(DatastoreType::RUNNING)
-            .expect("Failed to create session");
+        let conn = Arc::new(Mutex::new(conn));
+        ensure_test_module(&conn).expect("Failed to ensure module");
+
+        let mut sess =
+            Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
 
         for i in vec![10u32, 20u32, 30u32] {
             let v = i.into();
