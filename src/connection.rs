@@ -5,81 +5,93 @@
 //
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::session::{ImplicitSession, Session, SessionContextHolder};
+use crate::types::*;
 use num_traits::FromPrimitive;
 use std::ffi::CString;
-use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-
-use crate::session::{Session, SessionInner};
-use crate::types::*;
+use std::sync::{Arc, Mutex};
 
 use libyang2_sys::ly_ctx;
-use yang2::context::Context as YContext;
+use yang2::context::ContextAllocator;
 
 use sysrepo2_sys as ffi;
 
-pub struct Connection {
-    pub(crate) raw: *mut ffi::sr_conn_ctx_t,
+enum ConnectionOrSession {
+    Connection(Arc<Mutex<Connection>>),
+    Session(Arc<Mutex<Session>>),
+    ImplicitSession(ImplicitSession),
 }
 
-pub enum ConnectionOrSession<'a> {
-    Connection(&'a Connection),
-    Session(&'a Session<'a>),
+pub struct SysrepoContextAllocator {
+    ctx: ConnectionOrSession,
+    raw: *mut ly_ctx,
 }
 
-pub struct Context<'a> {
-    ctx: ConnectionOrSession<'a>,
-    pub(crate) raw: Option<YContext>,
-}
-
-impl<'a> Context<'a> {
-    fn from_connection(conn: &'a Connection) -> Context<'a> {
+impl SysrepoContextAllocator {
+    pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
         unsafe {
-            let ctx = ffi::sr_acquire_context(conn.raw);
-            let raw = YContext::from_raw(ctx as *mut ly_ctx);
-            Context {
-                raw: Some(raw),
+            let ctx = ffi::sr_acquire_context(conn.lock().unwrap().raw());
+            let raw = ctx as *mut ly_ctx;
+            Self {
+                raw: raw,
                 ctx: ConnectionOrSession::Connection(conn),
             }
         }
     }
 
-    pub(crate) fn from_session(sess: &'a Session<'a>) -> Context<'a> {
+    pub fn from_session(sess: Arc<Mutex<Session>>) -> Self {
         unsafe {
-            let ctx = ffi::sr_session_acquire_context(sess.inner.0);
-            let raw = YContext::from_raw(ctx as *mut ly_ctx);
-            Context {
-                raw: Some(raw),
+            let ctx = ffi::sr_session_acquire_context(sess.lock().unwrap().raw());
+            let raw = ctx as *mut ly_ctx;
+            Self {
+                raw: raw,
                 ctx: ConnectionOrSession::Session(sess),
+            }
+        }
+    }
+
+    pub(crate) fn from_implicit_session(sess: ImplicitSession) -> Self {
+        unsafe {
+            let ctx = ffi::sr_session_acquire_context(sess.raw());
+            let raw = ctx as *mut ly_ctx;
+            Self {
+                raw: raw,
+                ctx: ConnectionOrSession::ImplicitSession(sess),
             }
         }
     }
 }
 
-impl<'a> Deref for Context<'a> {
-    type Target = YContext;
-
-    fn deref(&self) -> &Self::Target {
-        &self.raw.as_ref().unwrap()
-    }
-}
-
-impl<'a> Drop for Context<'a> {
+impl Drop for SysrepoContextAllocator {
     fn drop(&mut self) {
-        // we must free self.raw by using sr_release_context() or sr_session_release_context().
-        // take the ownership of self.raw here and use std::mem::forget() so that
-        // YContext::drop() doesn't get executed for the ctx.
-        std::mem::forget(std::mem::replace(&mut self.raw, None));
-
-        match self.ctx {
-            ConnectionOrSession::Connection(conn) => unsafe { ffi::sr_release_context(conn.raw) },
+        match &self.ctx {
+            ConnectionOrSession::Connection(conn) => unsafe {
+                ffi::sr_release_context(conn.lock().unwrap().raw())
+            },
             ConnectionOrSession::Session(sess) => unsafe {
-                ffi::sr_session_release_context(sess.inner.0)
+                ffi::sr_session_release_context(sess.lock().unwrap().raw())
+            },
+            ConnectionOrSession::ImplicitSession(sess) => unsafe {
+                ffi::sr_session_release_context(sess.raw())
             },
         };
     }
 }
+
+impl ContextAllocator for SysrepoContextAllocator {
+    fn raw(&self) -> *mut ly_ctx {
+        self.raw
+    }
+}
+
+#[derive(Debug)]
+pub struct Connection {
+    raw: *mut ffi::sr_conn_ctx_t,
+}
+
+unsafe impl Send for Connection {}
 
 impl Connection {
     pub fn new(options: ConnectionOptions) -> Result<Connection> {
@@ -90,27 +102,8 @@ impl Connection {
             .map_or_else(|| Ok(Connection { raw: conn }), |ret| Err(Error::new(ret)))
     }
 
-    pub fn create_session(&mut self, t: DatastoreType) -> Result<Session> {
-        let mut sess = std::ptr::null_mut();
-        let sess_ptr = &mut sess;
-
-        ErrorCode::from_i32(unsafe { ffi::sr_session_start(self.raw, t as u32, sess_ptr) })
-            .map_or_else(
-                || {
-                    Ok(Session {
-                        _sub_callbacks: Vec::new(),
-                        _sub_handles: Vec::new(),
-                        _sub_ctxs: Vec::new(),
-                        inner: SessionInner(sess),
-                        _marker: std::marker::PhantomData,
-                    })
-                },
-                |ret| Err(Error::new(ret)),
-            )
-    }
-
-    pub fn get_context(&self) -> Context {
-        Context::from_connection(self)
+    pub(crate) fn raw(&self) -> *mut ffi::sr_conn_ctx_t {
+        self.raw
     }
 
     pub fn get_content_id(&self) -> u32 {
@@ -171,6 +164,9 @@ impl Drop for Connection {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::connection::*;
+    use crate::session::Session;
+    use std::sync::{Arc, Mutex};
+    use yang2::context::Context;
 
     #[test]
     fn create_connection() {
@@ -182,30 +178,42 @@ pub(crate) mod tests {
 
     #[test]
     fn test_session() {
-        let mut conn =
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        let mut sess = conn
-            .create_session(DatastoreType::RUNNING)
-            .expect("Failed to create session");
+        let conn = Arc::new(Mutex::new(conn));
+        let mut sess =
+            Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
         assert_eq!(sess.get_ds(), DatastoreType::RUNNING);
         sess.switch_ds(DatastoreType::OPERATIONAL)
             .expect("Failed to swtich datastore");
         assert_eq!(sess.get_ds(), DatastoreType::OPERATIONAL);
     }
 
-    pub(crate) fn ensure_test_module(conn: &mut Connection) -> Result<()> {
+    #[test]
+    fn test_multiple_sessions() {
+        let conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        let conn = Arc::new(Mutex::new(conn));
+        let _s1 = Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
+        let _s2 = Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
+    }
+
+    pub(crate) fn ensure_test_module(conn: &Arc<Mutex<Connection>>) -> Result<()> {
         let exists = {
-            let ctx = conn.get_context();
-            let m = ctx.get_module("test", None);
-            m != None
+            let a = SysrepoContextAllocator::from_connection(conn.clone());
+            let ctx = Context::from_allocator(Box::new(a)).unwrap();
+            ctx.get_module("test", None) != None
         };
 
         if !exists {
-            conn.install_module("./assets/yang/test.yang", &["./assets/yang"], &[])
+            conn.lock()
+                .unwrap()
+                .install_module("./assets/yang/test.yang", &["./assets/yang"], &[])
                 .unwrap();
         }
 
-        let ctx = conn.get_context();
+        let a = SysrepoContextAllocator::from_connection(conn.clone());
+        let ctx = Context::from_allocator(Box::new(a)).unwrap();
         let m = ctx.get_module("test", None).unwrap();
         assert_eq!(m.name(), "test");
 
@@ -213,20 +221,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_install_and_remove_module() {
-        let mut conn =
+    fn test_multiple_contexts() {
+        let conn =
             Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
-        ensure_test_module(&mut conn).expect("Failed to ensure module");
+        let conn = Arc::new(Mutex::new(conn));
 
-        conn.remove_module("test", false)
-            .expect("Failed to remove module");
+        let a1 = SysrepoContextAllocator::from_connection(Arc::clone(&conn));
+        let ctx1 = Context::from_allocator(Box::new(a1)).unwrap();
+        ctx1.get_module("test", None);
+
+        let a2 = SysrepoContextAllocator::from_connection(Arc::clone(&conn));
+        let ctx2 = Context::from_allocator(Box::new(a2)).unwrap();
+        ctx2.get_module("test", None);
+    }
+
+    #[test]
+    fn test_session_context() {
+        let conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        let conn = Arc::new(Mutex::new(conn));
+        let sess = Session::new(&conn, DatastoreType::RUNNING).expect("Failed to create session");
+        let sess = Arc::new(Mutex::new(sess));
+        let a = SysrepoContextAllocator::from_session(sess);
+        Context::from_allocator(Box::new(a)).unwrap();
+    }
+
+    #[test]
+    fn test_install_and_remove_module() {
+        let conn =
+            Connection::new(ConnectionOptions::DEFAULT).expect("Failed to create connection");
+        let conn = Arc::new(Mutex::new(conn));
+
+        ensure_test_module(&conn).expect("Failed to ensure module");
 
         {
-            let ctx = conn.get_context();
+            conn.lock()
+                .unwrap()
+                .remove_module("test", false)
+                .expect("Failed to remove module");
+        }
+
+        {
+            let a = SysrepoContextAllocator::from_connection(Arc::clone(&conn));
+            let ctx = Context::from_allocator(Box::new(a)).unwrap();
             let m = ctx.get_module("test", None);
             assert_eq!(m, None);
         }
 
-        ensure_test_module(&mut conn).expect("Failed to install module");
+        ensure_test_module(&conn).expect("Failed to install module");
     }
 }
