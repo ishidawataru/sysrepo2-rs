@@ -29,6 +29,8 @@ pub struct SysrepoContextAllocator {
     raw: *mut ly_ctx,
 }
 
+unsafe impl Send for SysrepoContextAllocator {}
+
 impl SysrepoContextAllocator {
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
         unsafe {
