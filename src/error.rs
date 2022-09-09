@@ -59,6 +59,16 @@ impl Error {
             error_format,
         }
     }
+
+    pub fn new_with_message(errcode: ErrorCode, msg: String) -> Error {
+        let error_format = None;
+        let msg = Some(msg);
+        Self {
+            errcode,
+            msg,
+            error_format,
+        }
+    }
 }
 
 impl From<YError> for Error {
